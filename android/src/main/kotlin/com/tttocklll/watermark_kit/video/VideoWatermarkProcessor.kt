@@ -126,7 +126,8 @@ internal class VideoWatermarkProcessor(private val appContext: Context) {
       try { setInteger("profile", MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline) } catch (_: Throwable) {}
       try { setInteger("level", MediaCodecInfo.CodecProfileLevel.AVCLevel31) } catch (_: Throwable) {}
     }
-    val encoder = createEncoderPreferSoftware(videoCodec) ?: MediaCodec.createEncoderByType(videoCodec)
+    val encoder = createEncoderPreferSoftware(videoCodec)
+      ?: error("WM: no software AVC encoder available (CPU-compute invariant; never fall back to a vendor HW encoder)")
     encoder.configure(encFmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
     val inputSurface = encoder.createInputSurface()
     encoder.start()
@@ -441,7 +442,8 @@ internal class VideoWatermarkProcessor(private val appContext: Context) {
     decoder.start()
 
     // Recreate encoder for safety
-    val encoder = createEncoderPreferSoftware(videoCodec) ?: MediaCodec.createEncoderByType(videoCodec)
+    val encoder = createEncoderPreferSoftware(videoCodec)
+      ?: error("WM: no software AVC encoder available (CPU-compute invariant; never fall back to a vendor HW encoder)")
     val encFmt = MediaFormat.createVideoFormat(videoCodec, encW, encH).apply {
       setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
       setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
@@ -671,7 +673,7 @@ internal class VideoWatermarkProcessor(private val appContext: Context) {
 
   private fun createDecoderPreferSoftware(mime: String): MediaCodec? {
     val list = MediaCodecList(MediaCodecList.REGULAR_CODECS)
-    val candidates = list.codecInfos.filter { !it.isEncoder && it.supportedTypes.any { t -> t.equals(mime, ignoreCase = true) } }
+    val candidates = list.codecInfos.filter { !it.isEncoder && isSoftwareCodec(it) && it.supportedTypes.any { t -> t.equals(mime, ignoreCase = true) } }
     val sorted = candidates.sortedBy { namePreferenceScore(it.name) }
     for (ci in sorted) {
       try {
@@ -682,6 +684,20 @@ internal class VideoWatermarkProcessor(private val appContext: Context) {
       }
     }
     return null
+  }
+
+  /**
+   * CPU-compute invariant: the watermark compose must run on a SOFTWARE codec
+   * so the computation stays on CPU and behaves identically across chipsets
+   * (Snapdragon/Exynos/MediaTek) — never a vendor HW codec. API 29+ exposes
+   * isSoftwareOnly(); older devices fall back to name classification (a vendor
+   * codec scores 10 and is therefore excluded).
+   */
+  private fun isSoftwareCodec(ci: android.media.MediaCodecInfo): Boolean {
+    if (android.os.Build.VERSION.SDK_INT >= 29) {
+      try { return ci.isSoftwareOnly } catch (_: Throwable) {}
+    }
+    return namePreferenceScore(ci.name) < 10
   }
 
   private fun namePreferenceScore(name: String): Int {
@@ -696,7 +712,7 @@ internal class VideoWatermarkProcessor(private val appContext: Context) {
 
   private fun createEncoderPreferSoftware(mime: String): MediaCodec? {
     val list = MediaCodecList(MediaCodecList.REGULAR_CODECS)
-    val candidates = list.codecInfos.filter { it.isEncoder && it.supportedTypes.any { t -> t.equals(mime, ignoreCase = true) } }
+    val candidates = list.codecInfos.filter { it.isEncoder && isSoftwareCodec(it) && it.supportedTypes.any { t -> t.equals(mime, ignoreCase = true) } }
     val sorted = candidates.sortedBy { namePreferenceScore(it.name) }
     for (ci in sorted) {
       try {
