@@ -74,6 +74,17 @@ final class VideoWatermarkProcessor {
     let t = videoTrack.preferredTransform
     let display = CGSize(width: abs(natural.applying(t).width), height: abs(natural.applying(t).height))
 
+    // Even-distribution decimation plan (mirrors Android + the Dart seam).
+    // totalFrames pre-count: a dedicated AVAssetReader sample walk over the
+    // video track (counts container samples without rendering). Chosen over
+    // `nominalFrameRate * duration` because nominalFrameRate is unreliable for
+    // these 1fps study composites. A separate reader is required since an
+    // AVAssetReader can only be started once.
+    let totalFrames = Self.countVideoSamples(asset: asset, track: videoTrack)
+    let plan = DecimationPlan.build(totalFrames: totalFrames, sourceDurationSec: duration)
+    var decodedIndex = 0
+    var keptIndex = 0
+
     // Prepare overlay CIImage once
     let overlayCI: CIImage? = try Self.prepareOverlayCI(request: request, plugin: plugin, baseWidth: display.width, baseHeight: display.height)
 
@@ -169,6 +180,14 @@ final class VideoWatermarkProcessor {
         if videoInput.isReadyForMoreMediaData, let sample = videoReaderOutput.copyNextSampleBuffer() {
           let pts = CMSampleBufferGetPresentationTimeStamp(sample)
           lastPTS = pts
+          // Keep/drop selection: copy every frame off the reader to advance it,
+          // but only render+append the evenly-sampled subset.
+          let keepThisFrame = plan.keep(decodedIndex)
+          decodedIndex += 1
+          if !keepThisFrame {
+            // Dropped: skip CIImage render + append entirely.
+            return
+          }
           guard let pool = adaptor.pixelBufferPool else { return }
           var pb: CVPixelBuffer? = nil
           CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pb)
@@ -188,12 +207,23 @@ final class VideoWatermarkProcessor {
               output = base
             }
             ciContext.render(output, to: dst, bounds: CGRect(x: 0, y: 0, width: display.width, height: display.height), colorSpace: CGColorSpace(name: CGColorSpace.sRGB))
-            _ = adaptor.append(dst, withPresentationTime: pts)
+            // When decimating, synthesize a monotonic 30fps PTS from the
+            // kept-frame counter; otherwise keep the source PTS. The writer
+            // session started at .zero, so kept PTS stays monotonic from 0.
+            let appendPTS = plan.active
+              ? CMTime(value: Int64(keptIndex), timescale: Int32(Decimation.targetFps))
+              : pts
+            _ = adaptor.append(dst, withPresentationTime: appendPTS)
+            keptIndex += 1
           }
 
-          // Progress
-          let p = max(0.0, min(1.0, CMTimeGetSeconds(pts) / max(0.001, duration)))
-          callbacks.onVideoProgress(taskId: taskId, progress: p, etaSec: max(0.0, duration - CMTimeGetSeconds(pts))) { _ in }
+          // Progress: kept-frame based when decimating (synthesized PTS spans
+          // only ~target frames), duration-based otherwise.
+          let p: Double = plan.active
+            ? Double(keptIndex) / Double(max(1, plan.target))
+            : max(0.0, min(1.0, CMTimeGetSeconds(pts) / max(0.001, duration)))
+          let eta: Double = plan.active ? 0.0 : max(0.0, duration - CMTimeGetSeconds(pts))
+          callbacks.onVideoProgress(taskId: taskId, progress: max(0.0, min(1.0, p)), etaSec: eta) { _ in }
         } else {
           // Back off a little
           usleep(2000)
@@ -251,6 +281,32 @@ final class VideoWatermarkProcessor {
       }
       self.tasks[taskId] = nil
     }
+  }
+
+  /// Pre-count the container video samples via a dedicated `AVAssetReader`
+  /// sample walk (no rendering). Used as the PRIMARY totalFrames estimator.
+  ///
+  /// DEVICE-PROBE: this yields the container sample count, which can differ
+  /// from the decodable frame count under B-frames / edit-lists. For the 1fps
+  /// all-keyframe study composites these are expected to match; record the
+  /// probe result and, if a device diverges, fall back to a decode-only count.
+  private static func countVideoSamples(asset: AVAsset, track: AVAssetTrack) -> Int {
+    guard let reader = try? AVAssetReader(asset: asset) else { return 0 }
+    let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+    output.alwaysCopiesSampleData = false
+    guard reader.canAdd(output) else { return 0 }
+    reader.add(output)
+    guard reader.startReading() else { return 0 }
+    var count = 0
+    while reader.status == .reading {
+      if output.copyNextSampleBuffer() != nil {
+        count += 1
+      } else {
+        break
+      }
+    }
+    reader.cancelReading()
+    return count
   }
 
   private static func estimateBitrate(width: Int, height: Int, fps: Float) -> Int {

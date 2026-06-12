@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'watermark_kit_platform_interface.dart';
 import 'video_task.dart';
 export 'video_task.dart';
+export 'src/video_decimation.dart';
 
 class WatermarkKit {
   Future<String?> getPlatformVersion() {

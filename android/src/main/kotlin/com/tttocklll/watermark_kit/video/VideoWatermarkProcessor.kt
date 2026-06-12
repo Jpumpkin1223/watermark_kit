@@ -180,6 +180,22 @@ internal class VideoWatermarkProcessor(private val appContext: Context) {
     var durationUs = extractor.getSampleTimeDurationUs(videoTrack)
     if (durationUs <= 0) durationUs = 1_000_000L
 
+    // Even-distribution decimation plan (M1 + M2). Primary totalFrames source is
+    // a cheap container-sample pre-count; duration*fpsGuess is only a sanity
+    // cross-check (guessFps defaults to 30.0 when KEY_FRAME_RATE is absent, so
+    // it over-counts ~30x on these 1fps composites and must NOT drive selection).
+    val totalFrames = extractor.countVideoSamples(videoTrack)
+    val durationFpsEstimate = (durationUs / 1_000_000.0) * fpsGuess
+    if (totalFrames > 0 && durationFpsEstimate > 0 &&
+        (durationFpsEstimate > totalFrames * 2.0 || totalFrames > durationFpsEstimate * 2.0)) {
+      WMLog.w("totalFrames pre-count=$totalFrames diverges >2x from duration*fps=$durationFpsEstimate; trusting pre-count")
+    }
+    val sourceDurationSec = durationUs / 1_000_000.0
+    val plan = DecimationPlan.build(totalFrames, sourceDurationSec)
+    val decState = DecimationState()
+    var decodedIndex = 0
+    WMLog.d("Decimation: total=$totalFrames durSec=$sourceDurationSec active=${plan.active} target=${plan.target}")
+
     val info = MediaCodec.BufferInfo()
     var sawInputEOS = false
     var sawOutputEOS = false
@@ -228,8 +244,14 @@ internal class VideoWatermarkProcessor(private val appContext: Context) {
         }
         outIndex >= 0 -> {
           val isDecEOS = (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
-          val render = info.size > 0 && !isDecEOS
-          decoder.releaseOutputBuffer(outIndex, render)
+          val hasFrame = info.size > 0 && !isDecEOS
+          // EOS is never a "frame" subject to keep/drop. Only real frames carry
+          // a decoded index and participate in the decimation selection.
+          val keepThisFrame = hasFrame && plan.keep(decodedIndex)
+          // For a dropped frame still release (render=false) to advance decode,
+          // skipping the entire GL/overlay/swap block below.
+          decoder.releaseOutputBuffer(outIndex, keepThisFrame)
+          if (hasFrame) decodedIndex++
           if (isDecEOS) {
             // Decoder signaled EOS: propagate to encoder so it can emit EOS
             if (!signaledEncoderEOS) {
@@ -242,7 +264,7 @@ internal class VideoWatermarkProcessor(private val appContext: Context) {
               }
             }
           }
-          if (render) {
+          if (keepThisFrame) {
             val stMatrix = gl.updateDecoderTexImage()
             // Draw into encoder surface
             gl.makeCurrent()
@@ -250,7 +272,12 @@ internal class VideoWatermarkProcessor(private val appContext: Context) {
             overlayInfo?.let { ov ->
               gl.drawOverlay(ov.posX, ov.posY, ov.wPx, ov.hPx, encW, encH, overlayTexId, req.opacity.toFloat())
             }
-            gl.setPresentationTime(info.presentationTimeUs * 1000)
+            // When decimating, synthesize a 30fps clock from the kept-frame
+            // counter; otherwise keep the source PTS (nanoseconds).
+            val ptsNs = if (plan.active) decState.nextPresentationTimeNs()
+                        else info.presentationTimeUs * 1000
+            gl.setPresentationTime(ptsNs)
+            if (plan.active) decState.advance()
             renderedFrames++
 
             // Start muxer once encoder has output format
@@ -290,9 +317,18 @@ internal class VideoWatermarkProcessor(private val appContext: Context) {
               outBuf.position(info.offset)
               outBuf.limit(info.offset + info.size)
               muxer.writeSampleData(videoTrackIndexMuxer, outBuf, info)
-              // progress
-              val p = info.presentationTimeUs.toDouble() / max(1.0, durationUs.toDouble())
-              safeProgress(callbacks, req.taskId!!, p.coerceIn(0.0, 1.0), max(0.0, (durationUs - info.presentationTimeUs) / 1_000_000.0))
+              // progress: when decimating, the synthesized 30fps PTS spans only
+              // ~targetFrameCount frames, so a duration-based denominator breaks.
+              // Use kept-frame progress instead. Non-decimated path keeps the
+              // existing duration-based progress.
+              val p = if (plan.active) {
+                (decState.keptIndex.toDouble() / max(1, plan.target).toDouble())
+              } else {
+                info.presentationTimeUs.toDouble() / max(1.0, durationUs.toDouble())
+              }
+              val eta = if (plan.active) 0.0
+                        else max(0.0, (durationUs - info.presentationTimeUs) / 1_000_000.0)
+              safeProgress(callbacks, req.taskId!!, p.coerceIn(0.0, 1.0), eta)
               encoderFrames++
             }
             encoder.releaseOutputBuffer(eIndex, false)
@@ -311,15 +347,17 @@ internal class VideoWatermarkProcessor(private val appContext: Context) {
         try { decoder.stop(); decoder.release() } catch (_: Throwable) {}
         try { encoder.stop(); encoder.release() } catch (_: Throwable) {}
         // Use same muxer (not started yet) and audioExtractor
-        // Reuse existing gl
-        processByteBuffer(req, callbacks, muxer, audioExtractor, audioTrackIndexMuxer, gl, encW, encH, rotation, videoCodec, bitrate, fpsGuess)
+        // Reuse existing gl. Pass the SAME decimation plan so the ByteBuffer
+        // fallback selects identical frames (it re-decodes from frame 0 with a
+        // fresh kept-frame counter).
+        processByteBuffer(req, callbacks, muxer, audioExtractor, audioTrackIndexMuxer, gl, encW, encH, rotation, videoCodec, bitrate, fpsGuess, plan)
         return
       }
     }
 
     if (!useSurfacePath && !task.cancelled) {
-      // Fallback: ByteBuffer decode path
-      processByteBuffer(req, callbacks, muxer, audioExtractor, audioTrackIndexMuxer, gl, encW, encH, rotation, videoCodec, bitrate, fpsGuess)
+      // Fallback: ByteBuffer decode path (same decimation plan as the surface path)
+      processByteBuffer(req, callbacks, muxer, audioExtractor, audioTrackIndexMuxer, gl, encW, encH, rotation, videoCodec, bitrate, fpsGuess, plan)
       // processByteBuffer handles muxer.stop/release etc.
       return
     }
@@ -381,13 +419,18 @@ internal class VideoWatermarkProcessor(private val appContext: Context) {
     rotation: Int,
     videoCodec: String,
     bitrate: Int,
-    fpsGuess: Double
+    fpsGuess: Double,
+    plan: DecimationPlan
   ) {
     val extractor = MediaExtractor()
     extractor.setDataSource(req.inputVideoPath)
     val (videoTrack, audioTrack) = selectTracks(extractor)
     extractor.selectTrack(videoTrack)
     val vFmt = extractor.getTrackFormat(videoTrack)
+    // Fresh kept-frame counter for this re-decode; the plan (built from
+    // totalFrames) is reused so the SAME source-frame indices are selected.
+    val decState = DecimationState()
+    var decodedIndex = 0
     // Configure decoder to ByteBuffer YUV420Flexible
     val fmt = MediaFormat.createVideoFormat(vFmt.getString(MediaFormat.KEY_MIME)!!, vFmt.getInteger(MediaFormat.KEY_WIDTH), vFmt.getInteger(MediaFormat.KEY_HEIGHT))
     fmt.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
@@ -448,9 +491,12 @@ internal class VideoWatermarkProcessor(private val appContext: Context) {
         outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {}
         outIndex >= 0 -> {
           val isDecEOS = (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
-          val render = info.size > 0 && !isDecEOS
+          val hasFrame = info.size > 0 && !isDecEOS
+          // EOS is never subject to keep/drop; only real frames carry an index.
+          val keepThisFrame = hasFrame && plan.keep(decodedIndex)
+          if (hasFrame) decodedIndex++
           val image = decoder.getOutputImage(outIndex)
-          if (render && image != null) {
+          if (keepThisFrame && image != null) {
             val yPlane = image.planes[0]
             val uPlane = image.planes[1]
             val vPlane = image.planes[2]
@@ -465,8 +511,15 @@ internal class VideoWatermarkProcessor(private val appContext: Context) {
             }
             image.close()
 
-            gl.setPresentationTime(info.presentationTimeUs * 1_000)
+            // Synthesized 30fps PTS when decimating; else source PTS (ns).
+            val ptsNs = if (plan.active) decState.nextPresentationTimeNs()
+                        else info.presentationTimeUs * 1_000
+            gl.setPresentationTime(ptsNs)
+            if (plan.active) decState.advance()
             gl.swapBuffers()
+          } else {
+            // Dropped (or EOS) frame: close the decoded image if any, skip GL/swap.
+            image?.close()
           }
           // Do not render on EOS
           decoder.releaseOutputBuffer(outIndex, false)
@@ -504,8 +557,16 @@ internal class VideoWatermarkProcessor(private val appContext: Context) {
             }
           }
 
-          val p = info.presentationTimeUs.toDouble() / max(1.0, durationUs.toDouble())
-          safeProgress(callbacks, req.taskId!!, p.coerceIn(0.0, 1.0), max(0.0, (durationUs - info.presentationTimeUs) / 1_000_000.0))
+          // Progress: kept-frame based when decimating (synthesized PTS spans
+          // only ~target frames), duration-based otherwise.
+          val p = if (plan.active) {
+            decState.keptIndex.toDouble() / max(1, plan.target).toDouble()
+          } else {
+            info.presentationTimeUs.toDouble() / max(1.0, durationUs.toDouble())
+          }
+          val eta = if (plan.active) 0.0
+                    else max(0.0, (durationUs - info.presentationTimeUs) / 1_000_000.0)
+          safeProgress(callbacks, req.taskId!!, p.coerceIn(0.0, 1.0), eta)
         }
       }
     }
@@ -670,6 +731,35 @@ internal class VideoWatermarkProcessor(private val appContext: Context) {
 
   private fun MediaExtractor.unselectAll() {
     for (i in 0 until trackCount) try { unselectTrack(i) } catch (_: Throwable) {}
+  }
+
+  /**
+   * Cheap container-sample pre-count for the given video track, used as the
+   * PRIMARY `totalFrames` estimator (M1). Walks `readSampleData` with a 1-byte
+   * buffer (no pixel decode) to EOS, counting non-negative reads, then resets
+   * the extractor with `seekTo(0, SEEK_TO_PREVIOUS_SYNC)`.
+   *
+   * DEVICE-PROBE: this yields the CONTAINER sample count, which can differ from
+   * the DECODED frame count under B-frames or edit-lists. For the 1fps
+   * all-keyframe study composites these are expected to be equal; if a device
+   * shows divergence, fall back to a true decode-only count pass (decode every
+   * frame, render none, count outputs).
+   */
+  private fun MediaExtractor.countVideoSamples(videoTrack: Int): Int {
+    val tk = videoTrack
+    unselectAll(); selectTrack(tk)
+    seekTo(0, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+    var count = 0
+    val probe = ByteBuffer.allocate(1)
+    while (true) {
+      val size = readSampleData(probe, 0)
+      if (size < 0) break
+      count++
+      advance()
+    }
+    unselectAll(); selectTrack(tk)
+    seekTo(0, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+    return count
   }
 
   private fun MediaExtractor.getSampleTimeDurationUs(videoTrack: Int): Long {
