@@ -735,9 +735,9 @@ internal class VideoWatermarkProcessor(private val appContext: Context) {
 
   /**
    * Cheap container-sample pre-count for the given video track, used as the
-   * PRIMARY `totalFrames` estimator (M1). Walks `readSampleData` with a 1-byte
-   * buffer (no pixel decode) to EOS, counting non-negative reads, then resets
-   * the extractor with `seekTo(0, SEEK_TO_PREVIOUS_SYNC)`.
+   * PRIMARY `totalFrames` estimator (M1). Walks the sample table via
+   * getSampleTime()/advance() (no data copy) to EOS, counting samples, then
+   * resets the extractor with `seekTo(0, SEEK_TO_PREVIOUS_SYNC)`.
    *
    * DEVICE-PROBE: this yields the CONTAINER sample count, which can differ from
    * the DECODED frame count under B-frames or edit-lists. For the 1fps
@@ -750,12 +750,13 @@ internal class VideoWatermarkProcessor(private val appContext: Context) {
     unselectAll(); selectTrack(tk)
     seekTo(0, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
     var count = 0
-    val probe = ByteBuffer.allocate(1)
-    while (true) {
-      val size = readSampleData(probe, 0)
-      if (size < 0) break
+    // Count samples WITHOUT readSampleData: a too-small buffer makes
+    // MediaExtractor.readSampleData throw IllegalArgumentException on some
+    // codecs (e.g. Qualcomm c2.qti). getSampleTime()/advance() walks the
+    // sample table with no data copy, so it is cheap AND crash-safe.
+    while (sampleTime >= 0) {
       count++
-      advance()
+      if (!advance()) break
     }
     unselectAll(); selectTrack(tk)
     seekTo(0, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
@@ -775,11 +776,9 @@ internal class VideoWatermarkProcessor(private val appContext: Context) {
     val tk = videoTrack
     val save = this.sampleTime
     unselectAll(); selectTrack(tk)
-    while (true) {
-      val size = readSampleData(ByteBuffer.allocate(1), 0)
-      if (size < 0) break
+    while (sampleTime >= 0) {
       last = sampleTime
-      advance()
+      if (!advance()) break
     }
     unselectAll(); selectTrack(tk)
     seekTo(save, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
