@@ -1,5 +1,6 @@
 import Foundation
 import Flutter
+import UIKit
 
 // Pigeon generated API is in Messages.g.swift
 
@@ -109,7 +110,9 @@ final class WatermarkApiImpl: WatermarkApi {
       completion(.failure(PigeonError(code: "messenger_missing", message: "Binary messenger unavailable", details: nil)))
       return
     }
-    let callbacks = WatermarkCallbacks(binaryMessenger: messenger)
+    let callbacks = LifecycleAwareWatermarkCallbacks(
+      wrapped: WatermarkCallbacks(binaryMessenger: messenger)
+    )
     let taskId = request.taskId ?? UUID().uuidString
     // Start async processing and fulfill the Pigeon completion via closures.
     videoProcessor.start(
@@ -118,9 +121,11 @@ final class WatermarkApiImpl: WatermarkApi {
       callbacks: callbacks,
       taskId: taskId,
       onComplete: { res in
+        guard LifecycleAwareWatermarkCallbacks.canSendToFlutter else { return }
         completion(.success(res))
       },
       onError: { code, message in
+        guard LifecycleAwareWatermarkCallbacks.canSendToFlutter else { return }
         completion(.failure(PigeonError(code: code, message: message, details: nil)))
       }
     )
@@ -128,5 +133,59 @@ final class WatermarkApiImpl: WatermarkApi {
 
   func cancel(taskId: String) throws {
     videoProcessor.cancel(taskId: taskId)
+  }
+}
+
+final class LifecycleAwareWatermarkCallbacks: WatermarkCallbacksProtocol {
+  private let wrapped: WatermarkCallbacksProtocol
+
+  init(wrapped: WatermarkCallbacksProtocol) {
+    self.wrapped = wrapped
+  }
+
+  func onVideoProgress(taskId taskIdArg: String, progress progressArg: Double, etaSec etaSecArg: Double, completion: @escaping (Result<Void, PigeonError>) -> Void) {
+    guard canSendToFlutter else {
+      completion(.success(()))
+      return
+    }
+    wrapped.onVideoProgress(
+      taskId: taskIdArg,
+      progress: progressArg,
+      etaSec: etaSecArg,
+      completion: completion
+    )
+  }
+
+  func onVideoCompleted(result resultArg: ComposeVideoResult, completion: @escaping (Result<Void, PigeonError>) -> Void) {
+    guard canSendToFlutter else {
+      completion(.success(()))
+      return
+    }
+    wrapped.onVideoCompleted(result: resultArg, completion: completion)
+  }
+
+  func onVideoError(taskId taskIdArg: String, code codeArg: String, message messageArg: String, completion: @escaping (Result<Void, PigeonError>) -> Void) {
+    guard canSendToFlutter else {
+      completion(.success(()))
+      return
+    }
+    wrapped.onVideoError(
+      taskId: taskIdArg,
+      code: codeArg,
+      message: messageArg,
+      completion: completion
+    )
+  }
+
+  fileprivate static var canSendToFlutter: Bool {
+    Thread.isMainThread
+      ? UIApplication.shared.applicationState != .background
+      : DispatchQueue.main.sync {
+        UIApplication.shared.applicationState != .background
+      }
+  }
+
+  private var canSendToFlutter: Bool {
+    Self.canSendToFlutter
   }
 }

@@ -21,7 +21,7 @@ final class VideoWatermarkProcessor {
 
   func start(plugin: WatermarkKitPlugin,
              request: ComposeVideoRequest,
-             callbacks: WatermarkCallbacks,
+             callbacks: WatermarkCallbacksProtocol,
              taskId: String,
              onComplete: @escaping (ComposeVideoResult) -> Void,
              onError: @escaping (_ code: String, _ message: String) -> Void) {
@@ -59,7 +59,7 @@ final class VideoWatermarkProcessor {
 
   private func process(plugin: WatermarkKitPlugin,
                        state: TaskState,
-                       callbacks: WatermarkCallbacks,
+                       callbacks: WatermarkCallbacksProtocol,
                        taskId: String,
                        onComplete: @escaping (ComposeVideoResult) -> Void,
                        onError: @escaping (_ code: String, _ message: String) -> Void) throws {

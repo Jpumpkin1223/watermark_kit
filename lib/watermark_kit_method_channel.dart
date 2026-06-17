@@ -316,7 +316,20 @@ class MethodChannelWatermarkKit extends WatermarkKitPlatform {
       progress: ctrl.stream,
       done: completer.future,
       cancel: () async {
-        await pigeon.WatermarkApi().cancel(taskId);
+        try {
+          await pigeon.WatermarkApi().cancel(taskId);
+        } finally {
+          final st = _tasks.remove(taskId);
+          if (st != null && !st.completer.isCompleted) {
+            final err = PlatformException(
+              code: 'cancelled',
+              message: 'Cancelled',
+            );
+            st.ctrl.addError(err);
+            await st.ctrl.close();
+            st.completer.completeError(err);
+          }
+        }
       },
     );
   }

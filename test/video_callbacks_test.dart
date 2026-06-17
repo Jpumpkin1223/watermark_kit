@@ -78,4 +78,55 @@ void main() {
     expect(res.width, 1280);
     expect(res.codec, 'h264');
   });
+
+  test('cancel removes the task before delayed native callbacks arrive', () async {
+    final codec = pigeon.WatermarkCallbacks.pigeonChannelCodec;
+
+    const composeVideoChannel = 'dev.flutter.pigeon.watermark_kit.WatermarkApi.composeVideo';
+    const cancelChannel = 'dev.flutter.pigeon.watermark_kit.WatermarkApi.cancel';
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMessageHandler(composeVideoChannel, (ByteData? message) async {
+      final List<Object?>? args = codec.decodeMessage(message) as List<Object?>?;
+      final req = args![0] as pigeon.ComposeVideoRequest;
+
+      Future.delayed(const Duration(milliseconds: 10), () {
+        final completedChan = const BasicMessageChannel<Object?>(
+            'dev.flutter.pigeon.watermark_kit.WatermarkCallbacks.onVideoCompleted',
+            StandardMessageCodec());
+        final res = pigeon.ComposeVideoResult(
+          taskId: req.taskId!,
+          outputVideoPath: '/tmp/out.mp4',
+          width: 1280,
+          height: 720,
+          durationMs: 1000,
+          codec: pigeon.VideoCodec.h264,
+        );
+        final ByteData msg = codec.encodeMessage(<Object?>[res])!;
+        // ignore: invalid_use_of_protected_member
+        ServicesBinding.instance.defaultBinaryMessenger.handlePlatformMessage(
+          completedChan.name,
+          msg,
+          (ByteData? _) {},
+        );
+      });
+
+      return Completer<ByteData?>().future;
+    });
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMessageHandler(cancelChannel, (ByteData? message) async {
+      return codec.encodeMessage(<Object?>[null]);
+    });
+
+    final task = await WatermarkKit().composeVideo(
+      inputVideoPath: '/tmp/in.mp4',
+      text: 'hello',
+    );
+    await task.cancel();
+
+    await expectLater(
+      task.done,
+      throwsA(isA<PlatformException>().having((e) => e.code, 'code', 'cancelled')),
+    );
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+  });
 }
