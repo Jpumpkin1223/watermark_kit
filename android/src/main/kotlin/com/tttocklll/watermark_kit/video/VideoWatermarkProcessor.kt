@@ -21,6 +21,7 @@ internal class VideoWatermarkProcessor(private val appContext: Context) {
   private val thread = HandlerThread("wm.video").apply { start() }
   private val handler = Handler(thread.looper)
   private val main = Handler(Looper.getMainLooper())
+  @Volatile private var disposed = false
 
   private data class Task(
     val req: ComposeVideoRequest,
@@ -41,21 +42,43 @@ internal class VideoWatermarkProcessor(private val appContext: Context) {
       File(dir, "wm_${taskId}.mp4").absolutePath
     }
     val task = Task(request.copy(taskId = taskId), out)
-    tasks[taskId] = task
-    handler.post {
-      try {
-        process(task, callbacks, onCompleted)
-      } catch (t: Throwable) {
-        WMLog.e("Video compose failed", t)
-        safeError(callbacks, taskId, "compose_failed", t.message ?: "Unknown error")
-        onError("compose_failed", t.message ?: "Unknown error")
-      } finally {
+    synchronized(this) {
+      if (disposed) {
+        onError("engine_detached", "FlutterEngine is detached")
+        return
+      }
+      tasks[taskId] = task
+      val posted = handler.post {
+        try {
+          process(task, callbacks, onCompleted)
+        } catch (t: Throwable) {
+          WMLog.e("Video compose failed", t)
+          safeError(callbacks, taskId, "compose_failed", t.message ?: "Unknown error")
+          if (!disposed) onError("compose_failed", t.message ?: "Unknown error")
+        } finally {
+          tasks.remove(taskId)
+        }
+      }
+      if (!posted) {
         tasks.remove(taskId)
+        onError("engine_detached", "FlutterEngine is detached")
       }
     }
   }
 
   fun cancel(taskId: String) { tasks[taskId]?.cancelled = true }
+
+  fun dispose() {
+    synchronized(this) {
+      if (disposed) return
+      disposed = true
+      tasks.values.forEach { it.cancelled = true }
+      handler.removeCallbacksAndMessages(null)
+      tasks.clear()
+    }
+    main.removeCallbacksAndMessages(null)
+    thread.quitSafely()
+  }
 
   private fun process(task: Task, callbacks: WatermarkCallbacks, onCompleted: (ComposeVideoResult) -> Unit) {
     val req = task.req
@@ -736,13 +759,13 @@ internal class VideoWatermarkProcessor(private val appContext: Context) {
   }
 
   private fun safeProgress(cb: WatermarkCallbacks, taskId: String, p: Double, eta: Double) {
-    main.post { cb.onVideoProgress(taskId, p, eta) { } }
+    if (!disposed) main.post { if (!disposed) cb.onVideoProgress(taskId, p, eta) { } }
   }
   private fun safeCompleted(cb: WatermarkCallbacks, res: ComposeVideoResult) {
-    main.post { cb.onVideoCompleted(res) { } }
+    if (!disposed) main.post { if (!disposed) cb.onVideoCompleted(res) { } }
   }
   private fun safeError(cb: WatermarkCallbacks, taskId: String, code: String, message: String) {
-    main.post { cb.onVideoError(taskId, code, message) { } }
+    if (!disposed) main.post { if (!disposed) cb.onVideoError(taskId, code, message) { } }
   }
 
   private fun MediaExtractor.unselectAll() {
