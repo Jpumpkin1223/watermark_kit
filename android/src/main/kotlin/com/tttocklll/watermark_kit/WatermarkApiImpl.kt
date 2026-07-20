@@ -9,7 +9,9 @@ internal class WatermarkApiImpl(
   private val messenger: BinaryMessenger,
 ) : WatermarkApi {
 
-  private val video = VideoWatermarkProcessor(context)
+  private val lifecycleLock = Any()
+  @Volatile private var disposed = false
+  private var video: VideoWatermarkProcessor? = null
 
   override fun composeImage(request: ComposeImageRequest, callback: (Result<ComposeImageResult>) -> Unit) {
     try {
@@ -64,17 +66,48 @@ internal class WatermarkApiImpl(
   }
 
   override fun composeVideo(request: ComposeVideoRequest, callback: (Result<ComposeVideoResult>) -> Unit) {
-    val cb = WatermarkCallbacks(messenger)
-    video.start(
-      request = request,
-      callbacks = cb,
-      onCompleted = { res -> callback(Result.success(res)) },
-      onError = { code, msg -> callback(Result.failure(FlutterError(code, msg, null))) }
-    )
+    val started = synchronized(lifecycleLock) {
+      if (disposed) {
+        false
+      } else {
+        val processor = video ?: VideoWatermarkProcessor(context).also { video = it }
+        val cb = WatermarkCallbacks(messenger)
+        processor.start(
+          request = request,
+          callbacks = cb,
+          onCompleted = { res -> deliverIfAttached(callback, Result.success(res)) },
+          onError = { code, msg ->
+            deliverIfAttached(callback, Result.failure(FlutterError(code, msg, null)))
+          }
+        )
+        true
+      }
+    }
+    if (!started) {
+      callback(Result.failure(FlutterError("engine_detached", "FlutterEngine is detached", null)))
+    }
   }
 
   override fun cancel(taskId: String) {
-    video.cancel(taskId)
+    synchronized(lifecycleLock) { video }?.cancel(taskId)
+  }
+
+  fun dispose() {
+    val processor = synchronized(lifecycleLock) {
+      if (disposed) return
+      disposed = true
+      video.also { video = null }
+    }
+    processor?.dispose()
+  }
+
+  private fun deliverIfAttached(
+    callback: (Result<ComposeVideoResult>) -> Unit,
+    result: Result<ComposeVideoResult>,
+  ) {
+    synchronized(lifecycleLock) {
+      if (!disposed) callback(result)
+    }
   }
 
   private fun guessBaseWidth(baseImageBytes: ByteArray): Double {
